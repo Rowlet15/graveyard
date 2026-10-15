@@ -7,7 +7,8 @@ const GY = (() => {
   const DIFS = ["EASY", "NORMAL", "HARD"];
   const HERO_FIELDS = ["sec", "best", "kills", "dmg", "taken", "shots", "hits", "xp", "wsum",
     "runs", "wins", "big", "abil", "ults", "dodge", "bw"];
-  const PF_MAXH = 16, PF_LEN = 4 + PF_MAXH * 49 + 65 + 4, SAVE_LEN = 40;
+  // SAVE_LEN: version 2 of graveyard.sav (96 bytes: progression at 32-79); version 1 was 40
+  const PF_MAXH = 16, PF_LEN = 4 + PF_MAXH * 49 + 65 + 4, SAVE_LEN = 96;
   const B45 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:";
 
   function hash(x) {
@@ -37,7 +38,7 @@ const GY = (() => {
     return Uint8Array.from(out);
   }
 
-  function parseBytes(b) {
+  function parseBytes(b, ver = 2) {   // ver 3 (GY3) adds progression at the end
     if (b.length < 8) throw new Error("backup is too short");
     let h = 0x6B5C0DE;
     for (let i = 0; i < b.length - 4; i++) h = hash(h ^ b[i]);
@@ -73,11 +74,17 @@ const GY = (() => {
     g.bestDif = [V(), V(), V()];
     g.winMask = V(); g.longestHero = V(); g.mostKillsHero = V(); g.flags = V();
     d.g = g;
+    d.asc = 0; d.prog = [];                            // progression: ascension level chosen; per hero open level, alternates
+    if (ver >= 3) {
+      d.asc = V();
+      for (let i = 0; i < d.nh; i++) d.prog.push({ ascMax: V(), altOpen: V(), altSel: V() });
+    }
     if (p !== end) throw new Error("backup has extra data");
     return d;
   }
 
-  // GY2 (the link the game shows now): base38, 8 characters per 5 bytes, little-endian digits
+  // GY3 (the link the game shows now; GY2 before progression was added): base38, 8 characters per 5 bytes,
+  // little-endian digits
   const B38 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ.-";
   function b38decode(t) {
     const tailBytes = { 0: 0, 2: 1, 4: 2, 5: 3, 7: 4 };
@@ -96,13 +103,15 @@ const GY = (() => {
   // a backup from anything that holds one: the link, the part after '#', or older GY1 text
   function parseText(text) {
     let t = String(text).replace(/[\r\n]+/g, "");
-    const i2 = t.indexOf("GY2");
-    if (i2 >= 0) {
-      const m = t.slice(i2 + 3).match(/^[0-9A-Z.\-]*/)[0];
-      return parseBytes(b38decode(m));
+    for (const ver of [3, 2]) {
+      const i2 = t.indexOf("GY" + ver);
+      if (i2 >= 0) {
+        const m = t.slice(i2 + 3).match(/^[0-9A-Z.\-]*/)[0];
+        return parseBytes(b38decode(m), ver);
+      }
     }
     const i = t.indexOf("GY1");
-    if (i < 0) throw new Error("not a Graveyard backup (no GY2 or GY1 in it)");
+    if (i < 0) throw new Error("not a Graveyard backup (no GY3, GY2 or GY1 in it)");
     t = t.slice(i + 3);
     // a pasted copy may have lost trailing spaces (space is a base45 digit): try them back
     let lastErr;
@@ -115,8 +124,10 @@ const GY = (() => {
   // the backup part of a text, as stored (the link prefix dropped)
   function backupPart(text) {
     const t = String(text).replace(/[\r\n]+/g, "");
-    const i2 = t.indexOf("GY2");
-    if (i2 >= 0) return "GY2" + t.slice(i2 + 3).match(/^[0-9A-Z.\-]*/)[0];
+    for (const ver of [3, 2]) {
+      const i2 = t.indexOf("GY" + ver);
+      if (i2 >= 0) return "GY" + ver + t.slice(i2 + 3).match(/^[0-9A-Z.\-]*/)[0];
+    }
     const i = t.indexOf("GY1");
     return i >= 0 ? "GY1" + t.slice(i + 3) : t;
   }
@@ -127,10 +138,14 @@ const GY = (() => {
 
   function saveFile(d) {
     const b = new Uint8Array(SAVE_LEN);
-    b[0] = 71; b[1] = 89; b[2] = 1;
+    b[0] = 71; b[1] = 89; b[2] = 2;
     put32(b, 4, d.best.score < 0 ? 0xFFFFFFFF : d.best.score);
     b[8] = d.best.hero; b[9] = d.best.dif; b[10] = cap8(d.best.wave);
     b[11] = d.hero; b[12] = d.dif; b[13] = d.toggles & 15;
+    b[25] = cap8(d.asc || 0);                          // progression (zeros for a GY2 or GY1 backup)
+    (d.prog || []).forEach((q, i) => {
+      if (i < 16) { b[32 + 3 * i] = cap8(q.ascMax); b[33 + 3 * i] = cap8(q.altOpen); b[34 + 3 * i] = cap8(q.altSel); }
+    });
     let h = 0x6EA7E5;
     for (let i = 0; i < SAVE_LEN - 4; i++) h = hash(h ^ b[i]);
     put32(b, SAVE_LEN - 4, h);

@@ -121,7 +121,7 @@ async function startScan() {
       cv.width = Math.round(v.videoWidth * k); cv.height = Math.round(v.videoHeight * k);
       cx.drawImage(v, 0, 0, cv.width, cv.height);
       const t = decodeCanvas(cv, cx);
-      if (t && /GY[12]/.test(t)) { stopScan(); addBackup(t, "from the camera"); return; }
+      if (t && /GY[123]/.test(t)) { stopScan(); addBackup(t, "from the camera"); return; }
       if (t) say("That QR isn't a Graveyard backup. Open BACKUP on the title menu in Graveyard.", "err");
     }
     scanTimer = setTimeout(tick, 120);
@@ -190,16 +190,18 @@ function renderDetail(b) {
   const order = d.heroes.slice(0, GY.HEROES.length).map((h, i) => [h, i]).sort((x, y) => y[0].sec - x[0].sec);
   const heroes = el("section", { style: "display:grid;gap:10px" }, el("h2", { text: "Heroes" }),
     el("div", { class: "tablewrap" }, el("table", {},
-      el("thead", {}, el("tr", {}, ...["Hero", "Level", "Time", "Runs", "Wins", "Best score", "Kills"].map((t, i) => el("th", { class: i ? "r" : "", text: t })))),
+      el("thead", {}, el("tr", {}, ...["Hero", "Level", "Time", "Runs", "Wins", "Ascension", "Best score", "Kills"].map((t, i) => el("th", { class: i ? "r" : "", text: t })))),
       el("tbody", {}, ...order.map(([h, i]) => el("tr", { class: h.sec || h.runs ? "" : "unplayed" },
         el("td", { text: GY.HEROES[i] }), el("td", { class: "r", text: String(Math.floor(h.xp / PF_XPH) + 1) }), el("td", { class: "r", text: h.sec ? fmtTime(h.sec) : "-" }),
-        el("td", { class: "r", text: fmt(h.runs) }), el("td", { class: "r", text: fmt(h.wins) }), el("td", { class: "r", text: h.best ? fmt(h.best) : "-" }),
+        el("td", { class: "r", text: fmt(h.runs) }), el("td", { class: "r", text: fmt(h.wins) }),
+        el("td", { class: "r", text: d.prog[i] && d.prog[i].ascMax ? "A" + d.prog[i].ascMax : "-" }),   // (GY3 backups: the highest level open)
+        el("td", { class: "r", text: h.best ? fmt(h.best) : "-" }),
         el("td", { class: "r", text: fmt(h.kills) })))))));
   const got = s.badges.filter(x => x.got).length;
   const badges = el("section", { style: "display:grid;gap:10px" }, el("h2", { text: "Badges · " + got + "/16" }),
     el("div", { class: "badges" }, ...s.badges.map(x => el("div", { class: "badge" + (x.got ? " got" : ""), title: x.what },
       el("b", { text: x.name }), x.got ? "Earned" : x.goal > 1 ? fmt(x.val) + " / " + fmt(x.goal) : x.what))));
-  D.replaceChildren(el("section", { class: "panel" }, head, stats), keepPanel(b), restorePanel(b, d), heroes, badges, b.example ? null : deleteControl(b));
+  D.replaceChildren(...[el("section", { class: "panel" }, head, stats), keepPanel(b), restorePanel(b, d), heroes, badges, b.example ? null : deleteControl(b)].filter(Boolean));   // (a null would show as "null")
 }
 
 // ---- a second copy: the link (opens this site with the backup) or a file
@@ -259,7 +261,7 @@ function restorePanel(b, d) {
       el("li", { text: "Plug the calculator into this computer and turn it on." }),
       el("li", { text: "Click Restore and pick the NumWorks calculator." })),
     el("div", { class: "actions" }, go), log,
-    b.example ? el("p", { class: "small muted", text: "That's the example. Add your own backup to restore it." }) : null);
+    ...(b.example ? [el("p", { class: "small muted", text: "That's the example. Add your own backup to restore it." })] : []));   // (append prints a null)
   return box;
 }
 
@@ -382,7 +384,7 @@ load();
 loadSync();
 renderSync();
 render();
-if (/GY[12]/.test(location.hash)) {
+if (/GY[123]/.test(location.hash)) {
   let t = location.hash.slice(1);
   try { t = decodeURIComponent(t); } catch {}
   history.replaceState(null, "", location.pathname + location.search);
@@ -390,7 +392,7 @@ if (/GY[12]/.test(location.hash)) {
 }
 if (sync) syncNow(true);
 window.addEventListener("hashchange", () => {
-  if (!/GY[12]/.test(location.hash)) return;
+  if (!/GY[123]/.test(location.hash)) return;
   const t = location.hash.slice(1);
   history.replaceState(null, "", location.pathname + location.search);
   addBackup(t, "from the link");
