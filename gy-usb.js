@@ -7,7 +7,7 @@
 const GYUSB = (() => {
   const DNLOAD = 1, UPLOAD = 2, GETSTATUS = 3, CLRSTATUS = 4, ABORT = 6;
   const S_IDLE = 2, S_DNLOADIDLE = 5, S_ERROR = 10;
-  const XFER = 2048, RAM_ALT = 1;
+  const XFER = 2048, WCHUNK = 1024, RAM_ALT = 1;
   const STO_MAGIC = 0xEE0BDDBA;
   const sleep = ms => new Promise(r => setTimeout(r, ms));
   const u32 = (b, o) => (b[o] | b[o + 1] << 8 | b[o + 2] << 16 | b[o + 3] << 24) >>> 0;
@@ -26,7 +26,9 @@ const GYUSB = (() => {
       return new Uint8Array(r.data.buffer, r.data.byteOffset, r.data.byteLength);
     }
     async status() {
-      const d = await this.inn(GETSTATUS, 0, 6);
+      let d;
+      try { d = await this.inn(GETSTATUS, 0, 6); }
+      catch (e) { await sleep(60); d = await this.inn(GETSTATUS, 0, 6); }   // one retry: some hosts report a busy device as a transfer error
       return { status: d[0], poll: d[1] | d[2] << 8 | d[3] << 16, state: d[4] };
     }
     async idle() {
@@ -61,11 +63,13 @@ const GYUSB = (() => {
       await this.dev.controlTransferOut(this.setup(ABORT, 0));
       return out;
     }
-    async write(addr, data) {
-      if (!data.length) return;
-      await this.setAddress(addr);
-      for (let off = 0, blk = 0; off < data.length; off += XFER, blk++) {
-        await this.out(DNLOAD, 2 + blk, data.subarray(off, Math.min(data.length, off + XFER)));
+    // write in small pieces, each at its own address (the way DfuSe tools do it)
+    async write(addr, data, log) {
+      for (let off = 0; off < data.length; off += WCHUNK) {
+        const piece = data.subarray(off, Math.min(data.length, off + WCHUNK));
+        if (log) log("  writing " + piece.length + " bytes at 0x" + ((addr + off) >>> 0).toString(16));
+        await this.setAddress(addr + off);
+        await this.out(DNLOAD, 2, piece);
         await this.waitDownloadIdle();
       }
       await this.dev.controlTransferOut(this.setup(ABORT, 0));
@@ -120,18 +124,26 @@ const GYUSB = (() => {
     return { list: out, end: p };
   }
 
-  // the storage with these files put in (replacing ones of the same name); returns the
-  // bytes to write from the start of the storage, or throws if they don't fit
+  // the storage with these files put in; returns the bytes from the start of the storage up to
+  // its end marker, or throws if they don't fit. A file already there with the same size (the
+  // game's two files always have the same size) is overwritten where it is, so nothing else
+  // moves; new files go at the end. Only a file whose size changed is taken out and added again.
   function withFiles(buf, files) {
     const { list } = records(buf);
-    const keep = list.filter(r => !(r.name in files));
+    const size = (name, data) => 2 + name.length + 1 + data.length;
+    const moved = new Set(Object.keys(files).filter(n => { const r = list.find(x => x.name === n); return !r || r.size !== size(n, files[n]); }));
     const parts = [buf.subarray(0, 4)];
-    for (const r of keep) parts.push(buf.subarray(r.start, r.start + r.size));
-    for (const [name, data] of Object.entries(files)) {
-      const nl = name.length + 1, rs = 2 + nl + data.length, rec = new Uint8Array(rs);
+    for (const r of list) {
+      if (moved.has(r.name)) continue;
+      const rec = buf.slice(r.start, r.start + r.size);
+      if (r.name in files) rec.set(files[r.name], 2 + r.name.length + 1);
+      parts.push(rec);
+    }
+    for (const name of moved) {
+      const data = files[name], rs = size(name, data), rec = new Uint8Array(rs);
       rec[0] = rs & 255; rec[1] = rs >> 8;
       for (let i = 0; i < name.length; i++) rec[2 + i] = name.charCodeAt(i);
-      rec.set(data, 2 + nl);
+      rec.set(data, 2 + name.length + 1);
       parts.push(rec);
     }
     parts.push(new Uint8Array(2));             // the end marker
@@ -143,6 +155,23 @@ const GYUSB = (() => {
     return out;
   }
 
-  return { open, findStorage, records, withFiles, Dfu };
+  // put the files in the calculator's storage. Only the bytes that change are written, and
+  // the two bytes where the change starts go last: until then the calculator still sees its
+  // old storage, so a transfer that breaks halfway leaves it as it was.
+  async function restore(dfu, st, files, log) {
+    const before = await dfu.read(st.addr, st.size);
+    const out = withFiles(before, files);
+    let d = 0;
+    while (d < out.length && out[d] === before[d]) d++;
+    if (d === out.length) { log("The calculator already has exactly this save."); return; }
+    const head = Math.min(out.length, d + 2);
+    log("Writing " + (out.length - d) + " bytes...");
+    if (head < out.length) await dfu.write(st.addr + head, out.subarray(head), log);
+    await dfu.write(st.addr + d, out.subarray(d, head), log);
+    const after = await dfu.read(st.addr + d, out.length - d);
+    if (!after.every((v, i) => v === out[d + i])) throw new Error("the calculator's memory didn't match after writing");
+  }
+
+  return { open, findStorage, records, withFiles, restore, Dfu };
 })();
 if (typeof module !== "undefined") module.exports = GYUSB;

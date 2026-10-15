@@ -243,15 +243,12 @@ function restorePanel(b, d) {
       const before = await dfu.read(st.addr, st.size);
       const had = GYUSB.records(before).list.some(r => r.name === "graveyard.pro");
       line("Found a " + st.model + ". Graveyard save on it now: " + (had ? "yes (it will be replaced)" : "none") + ".");
-      const out = GYUSB.withFiles(before, { "graveyard.sav": GY.saveFile(d), "graveyard.pro": GY.profileFile(d) });
-      await dfu.write(st.addr, out);
-      const after = await dfu.read(st.addr, out.length);
-      if (!after.every((v, i) => v === out[i])) throw new Error("the calculator's memory didn't match after writing");
+      await GYUSB.restore(dfu, st, { "graveyard.sav": GY.saveFile(d), "graveyard.pro": GY.profileFile(d) }, line);
       line("Restored. Unplug the calculator and open Graveyard: your profile is back.", "ok");
       try { await dev.close(); } catch {}
     } catch (e) {
       if (e && e.name === "NotFoundError") line("No calculator picked. Plug it in, turn it on, and try again.");
-      else line("Restore failed: " + (e && e.message || e), "err");
+      else line("Restore failed: " + (e && e.message || e) + ". Nothing on the calculator changed unless the log above shows the last write. Unplug it, plug it back in, and try once more; if it fails again, send me this log.", "err");
     }
     usbBusy = false; go.disabled = !!b.example;
   } });
