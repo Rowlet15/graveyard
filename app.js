@@ -69,6 +69,7 @@ function addBackup(text, how) {
   say(saved ? "Backup saved " + how + ": level " + s.level + ", " + fmtTime(s.sec) + " played."
     : "Backup read " + how + ", but this browser won't let the site save it (private browsing?). Save a backup file to keep it.", saved ? "ok" : "err");
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+  if (sync) uploadOne(rec).then(ok => { if (ok && saved) say("Backup saved " + how + " and sent to your other devices: level " + s.level + ", " + fmtTime(s.sec) + " played.", "ok"); });
   return true;
 }
 
@@ -165,7 +166,7 @@ function render() {
     return el("button", { class: "item", "aria-current": String(b.id === selected), onclick: () => { selected = b.id; render(); } },
       b.example ? el("span", { class: "tag", text: "Example" }) : null,
       el("span", { class: "when", text: b.example ? "Sample profile" : fmtDate(b.addedAt) }),
-      el("span", { class: "meta", text: "Level " + s.level + " · " + fmtTime(s.sec) + " · best " + (d.best.score >= 0 ? fmt(d.best.score) : "none") }));
+      el("span", { class: "meta", text: "Level " + s.level + " · " + fmtTime(s.sec) + " · best " + (d.best.score >= 0 ? fmt(d.best.score) : "none") + (b.synced ? " · synced" : "") }));
   }));
   renderDetail(items.find(b => b.id === selected));
 }
@@ -204,7 +205,8 @@ function renderDetail(b) {
 // ---- a second copy: the link (opens this site with the backup) or a file
 function keepPanel(b) {
   if (b.example) return null;
-  const msg = el("p", { class: "small muted", text: "This backup lives in this browser. For a second copy, save it as a file or copy its link (opening the link adds it to any browser, a computer's included)." });
+  const msg = el("p", { class: "small muted", text: b.synced && sync ? "This backup is also in your " + sync.repo + " repository, so your other connected devices have it."
+    : "This backup lives in this browser. For a second copy, turn on sync above, save it as a file, or copy its link (opening the link adds it to any browser)." });
   const copy = el("button", { class: "ghost", text: "Copy link", onclick: async () => {
     try { await navigator.clipboard.writeText(linkFor(b)); msg.textContent = "Link copied."; }
     catch { msg.textContent = linkFor(b); }
@@ -214,7 +216,8 @@ function keepPanel(b) {
     document.body.append(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(a.href), 2000);
   } });
-  return el("section", { class: "panel" }, el("h2", { text: "Keep a second copy" }), el("div", { class: "actions" }, copy, save), msg);
+  const view = b.synced && sync ? el("a", { class: "small", href: "https://github.com/" + sync.repo + "/blob/HEAD/" + b.synced, target: "_blank", rel: "noopener", text: "See the file on GitHub" }) : null;
+  return el("section", { class: "panel" }, el("h2", { text: "Keep a second copy" }), el("div", { class: "actions" }, copy, save, view), msg);
 }
 
 // ---- putting it back: USB, right here (Chrome or Edge on a computer)
@@ -266,15 +269,121 @@ function restorePanel(b, d) {
 function deleteControl(b) {
   const box = el("div", { class: "actions" });
   const ask = el("button", { class: "quiet", text: "Delete this backup", onclick: () => box.replaceChildren(
-    el("span", { class: "small", text: "Delete the backup from " + fmtDate(b.addedAt) + "?" }),
-    el("button", { class: "quiet", text: "Yes, delete", onclick: () => { backups = backups.filter(x => x.id !== b.id); persist(); render(); } }),
+    el("span", { class: "small", text: "Delete the backup from " + fmtDate(b.addedAt) + (b.synced && sync ? " here and from " + sync.repo + "?" : "?") }),
+    el("button", { class: "quiet", text: "Yes, delete", onclick: async () => {
+      if (b.synced && sync) {
+        try { await removeRemote(b.synced); }
+        catch (e) { box.replaceChildren(el("span", { class: "small", text: "Couldn't delete it from GitHub: " + e.message })); return; }
+      }
+      backups = backups.filter(x => x.id !== b.id); persist(); render();
+    } }),
     el("button", { class: "quiet", text: "Keep it", onclick: () => box.replaceChildren(ask) })) });
   box.append(ask);
   return box;
 }
 
+// ---- sync between devices: each backup is also a file in a private GitHub repository of
+// the user's (backups/<UTC date>_<check>.txt holding its link). Each device keeps a key
+// (a fine-grained token for that one repository, Contents: read and write) in its browser.
+const SYNC = "graveyard-sync";
+let sync = null, syncing = false, lastSync = 0;
+function loadSync() { try { const v = JSON.parse(localStorage.getItem(SYNC) || "null"); if (v && v.token && v.repo) sync = v; } catch {} }
+function saveSync() { try { if (sync) localStorage.setItem(SYNC, JSON.stringify(sync)); else localStorage.removeItem(SYNC); } catch {} }
+const textCheck = t => { let h = 0x9E37; for (let i = 0; i < t.length; i++) h = GY.hash(h ^ t.charCodeAt(i)); return h.toString(16).padStart(8, "0"); };
+const fileName = b => "backups/" + new Date(b.addedAt).toISOString().slice(0, 19).replace(/[:T]/g, "-") + "_" + textCheck(b.text) + ".txt";
+function dateFromName(n) {
+  const m = /(\d{4})-(\d{2})-(\d{2})-(\d{2})-(\d{2})-(\d{2})_/.exec(n);
+  return m ? Date.UTC(+m[1], m[2] - 1, +m[3], +m[4], +m[5], +m[6]) : Date.now();
+}
+async function gh(path, opts = {}, s = sync) {
+  const r = await fetch("https://api.github.com/repos/" + s.repo + path, { ...opts,
+    headers: { Accept: "application/vnd.github+json", Authorization: "Bearer " + s.token, "X-GitHub-Api-Version": "2022-11-28", ...(opts.headers || {}) } });
+  if (r.status === 401) throw new Error("GitHub didn't accept the key. Make a new one and connect again.");
+  if (r.status === 403 && r.headers.get("x-ratelimit-remaining") === "0") throw new Error("GitHub asks to slow down. Try again in a few minutes.");
+  return r;
+}
+const b64 = t => btoa(unescape(encodeURIComponent(t)));
+async function uploadOne(b) {
+  if (!sync || b.synced) return !!b.synced;
+  const name = fileName(b);
+  try {
+    const r = await gh("/contents/" + name, { method: "PUT", body: JSON.stringify({ message: "Graveyard backup " + new Date(b.addedAt).toISOString().slice(0, 16).replace("T", " ") + " UTC", content: b64(linkFor(b) + "\n") }) });
+    if (!r.ok && r.status !== 422) throw new Error("GitHub answered " + r.status + (r.status === 404 || r.status === 403 ? " (does the key allow writing to " + sync.repo + "?)" : ""));
+    b.synced = name; persist(); render();
+    return true;
+  } catch (e) { syncNote("Couldn't send the backup to GitHub: " + e.message, "err"); return false; }
+}
+async function removeRemote(name) {
+  const r = await gh("/contents/" + name);
+  if (r.status === 404) return;
+  if (!r.ok) throw new Error("GitHub answered " + r.status);
+  const { sha } = await r.json();
+  const d = await gh("/contents/" + name, { method: "DELETE", body: JSON.stringify({ message: "Delete Graveyard backup", sha }) });
+  if (!d.ok && d.status !== 404) throw new Error("GitHub answered " + d.status);
+}
+// fetch backups the other devices made, then send the ones only this device has
+async function syncNow(quiet) {
+  if (!sync || syncing) return;
+  syncing = true; lastSync = Date.now();
+  if (!quiet) syncNote("Syncing with " + sync.repo + "...");
+  try {
+    const r = await gh("/contents/backups");
+    const files = r.status === 404 ? [] : r.ok ? await r.json() : null;
+    if (!files) throw new Error("GitHub answered " + r.status + (r.status === 403 ? " (does the key include " + sync.repo + "?)" : ""));
+    const known = new Set(backups.map(b => b.synced).filter(Boolean)), checks = new Map(backups.map(b => [textCheck(b.text), b]));
+    let got = 0;
+    for (const f of Array.isArray(files) ? files : []) {
+      if (f.type !== "file" || !/\.txt$/.test(f.name) || known.has(f.path)) continue;
+      const local = checks.get((/_([0-9a-f]{8})\.txt$/.exec(f.name) || [])[1]);
+      if (local) { local.synced = f.path; continue; }
+      const fr = await gh("/contents/" + f.path, { headers: { Accept: "application/vnd.github.raw+json" } });
+      if (!fr.ok) continue;
+      const text = await fr.text();
+      try { GY.parseText(text); } catch { continue; }
+      const clean = GY.backupPart(text);
+      if (backups.some(b => b.text === clean)) continue;
+      backups.push({ id: "b" + Math.random().toString(36).slice(2, 10), text: clean, addedAt: dateFromName(f.name), synced: f.path });
+      got++;
+    }
+    persist();
+    let sent = 0;
+    for (const b of backups.filter(x => !x.synced)) if (await uploadOne(b)) sent++;
+    render();
+    syncNote("Synced with " + sync.repo + " at " + new Date().toLocaleTimeString(undefined, { timeStyle: "short" }) + "." +
+      (got ? " " + got + " new from your other devices." : "") + (sent ? " Sent " + sent + "." : ""), "ok");
+  } catch (e) { syncNote("Sync didn't work: " + e.message, "err"); }
+  syncing = false;
+}
+function syncNote(t, kind) { const n = $("syncMsg"); if (!n) return; n.hidden = false; n.className = "note " + (kind || ""); n.textContent = t; }
+function renderSync() {
+  $("syncOn").hidden = !sync; $("syncOff").hidden = !!sync;
+  if (sync) $("syncRepo").textContent = sync.repo;
+}
+$("syncConnect").addEventListener("click", async () => {
+  const token = $("syncToken").value.trim(), repo = $("syncRepoIn").value.trim().replace(/^https:\/\/github\.com\//, "").replace(/\/$/, "");
+  if (!token) return syncNote("Paste the key from GitHub first.", "err");
+  if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) return syncNote("Write the repository as owner/name, like Rowlet15/graveyard-saves.", "err");
+  const trial = { token, repo };
+  syncNote("Checking the key...");
+  try {
+    const r = await gh("", {}, trial);
+    if (r.status === 404) throw new Error("this key can't see " + repo + ". Check the name, and that the key was made for that repository.");
+    if (!r.ok) throw new Error("GitHub answered " + r.status + ".");
+    const info = await r.json();
+    if (info.permissions && !info.permissions.push) throw new Error("this key can read " + repo + " but not write to it. Give it Contents: Read and write.");
+    sync = trial; saveSync(); $("syncToken").value = ""; renderSync();
+    if (!info.private) syncNote("Connected, but " + repo + " is public: anyone can see your backups there. Make it private in its GitHub settings.", "err");
+    await syncNow(!!info.private ? false : true);
+  } catch (e) { syncNote("Couldn't connect: " + e.message, "err"); }
+});
+$("syncNow").addEventListener("click", () => syncNow(false));
+$("syncOffBtn").addEventListener("click", () => { sync = null; saveSync(); renderSync(); syncNote("This device no longer syncs. Its backups stay here; the files on GitHub stay too.", "ok"); });
+document.addEventListener("visibilitychange", () => { if (!document.hidden && sync && Date.now() - lastSync > 30000) syncNow(true); });
+
 // ---- start: saved backups, then the one in the link the QR opened (if any)
 load();
+loadSync();
+renderSync();
 render();
 if (/GY[12]/.test(location.hash)) {
   let t = location.hash.slice(1);
@@ -282,6 +391,7 @@ if (/GY[12]/.test(location.hash)) {
   history.replaceState(null, "", location.pathname + location.search);
   addBackup(t, "from the QR link");
 }
+if (sync) syncNow(true);
 window.addEventListener("hashchange", () => {
   if (!/GY[12]/.test(location.hash)) return;
   const t = location.hash.slice(1);
